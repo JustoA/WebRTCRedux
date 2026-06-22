@@ -1,53 +1,32 @@
 #!/usr/bin/env python3
 """
-client.py - Multi-peer WebRTC voice chat client (full mesh).
+Multi-peer WebRTC voice chat client (full mesh).
 
-Connects to server.py (a thin signalling relay) over a WebSocket. On
-joining, the server tells this client who's already in the room, and this
-client opens a direct RTCPeerConnection — and sends an offer — to each of
-them. When someone else joins later, THEY open a connection to everyone
-already present, including us, and we just answer.
+Each peer opens a direct RTCPeerConnection to every other participant;
+server.py only relays SDP -- no media touches it.
 
-Net effect: with N participants each client holds (N-1) PeerConnections,
-all negotiated directly and in parallel — no server-side media relay, which
-is what was causing the join delay in the SFU version.
+Usage:
+    python client.py [--server ws://HOST:8765] [--mic-device NAME] [--mic-format FMT]
 
-Your microphone is captured once (via MediaPlayer) and fanned out to every
-peer connection using MediaRelay. Each remote participant's audio gets its
-own playback stream (see play_remote_track below).
-
-Run:
-    pip install aiortc websockets sounddevice numpy av
-
-    python client.py --server ws://HOST:8765 [--mic-device ...] [--mic-format ...]
-
-Microphone device strings (only needed if auto-detection picks the wrong
-device — see `--mic-device` / `--mic-format` below):
-
-  macOS   (avfoundation): default is ":0"  -> device 0 = first audio input
-            list devices:  ffmpeg -f avfoundation -list_devices true -i ""
-  Linux   (pulse):         default is "default"
-            list devices:  pactl list short sources
-  Windows (dshow):         REQUIRED, e.g. "Microphone Array (Realtek)"
-            list devices:  ffmpeg -f dshow -list_devices true -i dummy
+Mic device (auto-detected on macOS/Linux; required on Windows):
+  macOS   -- ffmpeg -f avfoundation -list_devices true -i ""
+  Linux   -- pactl list short sources
+  Windows -- ffmpeg -f dshow -list_devices true -i dummy
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import deque
 import json
 import logging
 import platform
 import sys
 
+import numpy as np
 import sounddevice as sd
 import websockets
-from aiortc import (
-    RTCConfiguration,
-    RTCIceServer,
-    RTCPeerConnection,
-    RTCSessionDescription,
-)
+from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
 from aiortc.contrib.media import MediaPlayer, MediaRelay
 from aiortc.mediastreams import MediaStreamError
 from av import AudioResampler
@@ -55,169 +34,211 @@ from av import AudioResampler
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
 log = logging.getLogger("client")
 
-STUN_CONFIG  = RTCConfiguration(iceServers=[RTCIceServer(urls="stun:stun.l.google.com:19302")])
-OUTPUT_RATE  = 48_000   # sample rate we resample remote audio to before playback
+STUN   = RTCConfiguration(iceServers=[RTCIceServer(urls="stun:stun.l.google.com:19302")])
+RATE   = 48_000   # Hz -- Opus clock rate
+CHUNK  = 960      # samples per frame = 20 ms at 48 kHz
+MAXBUF = 12       # playback buffer depth (200 ms headroom for asyncio jitter)
+
+_MIC_DEFAULTS = {
+    "Darwin":  ("avfoundation", ":0"),
+    "Linux":   ("pulse",        "default"),
+    "Windows": ("dshow",        None),      # device name required
+}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Microphone — high-level MediaPlayer (ffmpeg device capture)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def open_microphone(device: str | None, fmt: str | None) -> tuple[MediaPlayer, "MediaStreamTrack"]:
-    """
-    Open the default microphone via aiortc's MediaPlayer, which reads
-    through PyAV/ffmpeg's device-capture demuxers. This handles real-time
-    pacing and resampling internally, avoiding the manual queue/PTS bugs
-    that cause pitch-shifted or choppy audio.
-    """
+def open_microphone(device: str | None, fmt: str | None):
     system = platform.system()
+    default_fmt, default_device = _MIC_DEFAULTS.get(system, (None, None))
+    fmt = fmt or default_fmt
+    device = device or default_device
 
-    if fmt is None:
-        fmt = {"Darwin": "avfoundation", "Linux": "pulse", "Windows": "dshow"}.get(system)
-        if fmt is None:
-            raise RuntimeError(f"Unsupported platform: {system}. Pass --mic-device/--mic-format manually.")
-
-    if device is None:
-        if system == "Darwin":
-            device = ":0"          # no video, audio device 0 (default input)
-        elif system == "Linux":
-            device = "default"     # pulse/pipewire default source
-        elif system == "Windows":
-            raise RuntimeError(
-                "On Windows you must pass --mic-device, e.g.\n"
-                '  --mic-device "Microphone Array (Realtek)"\n'
-                "List devices with:  ffmpeg -f dshow -list_devices true -i dummy"
-            )
-
-    if fmt == "dshow" and not device.startswith(("audio=", "video=")):
-        # dshow requires this prefix, but `ffmpeg -list_devices` doesn't show
-        # it — add it automatically so users can paste the name as-is.
+    if not fmt:
+        raise RuntimeError(f"Unsupported platform {system!r} -- pass --mic-format.")
+    if not device:
+        raise RuntimeError(
+            'On Windows --mic-device is required, e.g. "Microphone (Realtek)"\n'
+            "List devices:  ffmpeg -f dshow -list_devices true -i dummy"
+        )
+    if fmt == "dshow" and not device.startswith("audio="):
         device = f"audio={device}"
 
-    log.info("Opening microphone: format=%s device=%r", fmt, device)
+    log.info("Opening mic  format=%s  device=%r", fmt, device)
     player = MediaPlayer(device, format=fmt)
     if player.audio is None:
-        raise RuntimeError(
-            f"MediaPlayer opened {device!r} (format={fmt}) but it has no audio "
-            "track. Check the device name / try --mic-device."
-        )
+        raise RuntimeError(f"No audio stream from {device!r} (format={fmt})")
     return player, player.audio
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Speaker — one output stream per remote participant
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# Rather than hand-rolling a mixer, each remote track gets its own
-# sounddevice OutputStream playing to the default speaker. Audio backends
-# (CoreAudio, WASAPI, ALSA/PulseAudio) all happily mix multiple simultaneous
-# output streams for you, so this gets correct multi-speaker mixing "for
-# free" with far less code, at the cost of one extra audio stream per peer
-# (fine for typical voice-chat group sizes).
-
 async def play_remote_track(track) -> None:
-    """Pull frames from a remote track, resample to s16/mono, and play them."""
-    resampler = AudioResampler(format="s16", layout="mono", rate=OUTPUT_RATE)
-    stream = sd.OutputStream(samplerate=OUTPUT_RATE, channels=1, dtype="int16")
-    stream.start()
-    log.info("Playing remote track (stream open)")
+    """
+    Receive frames from a remote track and play them through the speaker.
 
+    The bounded deque drops the oldest frames if asyncio falls behind, so
+    latency is self-correcting rather than growing without bound.
+    """
+    resampler = AudioResampler(format="s16", layout="mono", rate=RATE)
+    buf      = deque(maxlen=MAXBUF)
+    leftover = np.array([], dtype=np.int16)
+
+    def callback(outdata: np.ndarray, frames: int, _t, _s) -> None:
+        nonlocal leftover
+        
+        pos = 0
+        # Use leftover data first
+        if len(leftover) > 0:
+            take = min(len(leftover), frames)
+            outdata[:take, 0] = leftover[:take]
+            leftover = leftover[take:]
+            pos = take
+        
+        # Fill remaining from buffer
+        while pos < frames and buf:
+            chunk = buf.popleft()
+            take = min(len(chunk), frames - pos)
+            outdata[pos:pos + take, 0] = chunk[:take]
+            pos += take
+            
+            # Save remainder for next callback
+            if take < len(chunk):
+                leftover = chunk[take:]
+                return
+        
+        # Pad with silence if buffer exhausted
+        if pos < frames:
+            outdata[pos:, 0] = 0
+
+    def push(frame) -> None:
+        for rf in resampler.resample(frame) or []:
+            buf.append(rf.to_ndarray().reshape(-1))
+
+    stream = sd.OutputStream(
+        samplerate=RATE, channels=1, dtype="int16",
+        latency="low", blocksize=CHUNK, callback=callback,
+    )
+    stream.start()
+    log.info("Speaker open  (hw latency=%.0f ms)", stream.latency * 1000)
     try:
         while True:
-            frame = await track.recv()
-            for rframe in (resampler.resample(frame) or []):
-                pcm = rframe.to_ndarray().reshape(-1)  # int16, mono
-                # write() blocks on PortAudio I/O, so run it off the event loop
-                await asyncio.to_thread(stream.write, pcm)
-    except MediaStreamError:
-        pass
-    except asyncio.CancelledError:
+            push(await track.recv())
+    except (MediaStreamError, asyncio.CancelledError):
         pass
     finally:
         stream.stop()
         stream.close()
-        log.info("Remote track ended (stream closed)")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Mesh connection manager
-# ─────────────────────────────────────────────────────────────────────────────
+async def log_stats(pc: RTCPeerConnection, peer_id: str, interval: float = 5.0) -> None:
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            stats = await pc.getStats()
+        except Exception:
+            return
+
+        metrics = {}
+        
+        for s in stats.values():
+            s_type = getattr(s, "type", "")
+            
+            # Extract audio inbound stats
+            if s_type == "inbound-rtp" and getattr(s, "kind", "") == "audio":
+                if (j := getattr(s, "jitter", None)) is not None:
+                    metrics["jitter"] = j / RATE * 1000  # ticks -> ms
+                if (lost := getattr(s, "packetsLost", None)) is not None:
+                    metrics["lost"] = lost
+                if (rx := getattr(s, "packetsReceived", None)) is not None:
+                    metrics["rx"] = rx
+            
+            # Extract audio outbound stats
+            elif s_type == "outbound-rtp" and getattr(s, "kind", "") == "audio":
+                if (tx := getattr(s, "packetsSent", None)) is not None:
+                    metrics["tx"] = tx
+            
+            # Extract connection quality stats
+            elif s_type == "candidate-pair" and getattr(s, "nominated", False):
+                if (r := getattr(s, "currentRoundTripTime", None)) is not None:
+                    metrics["rtt"] = r * 1000  # s -> ms
+
+        # Format and log stats
+        if metrics:
+            formatters = {
+                "rtt": lambda v: f"RTT={v:.1f}ms",
+                "jitter": lambda v: f"jitter={v:.1f}ms",
+                "lost": lambda v: f"lost={v}",
+                "rx": lambda v: f"rx={v}pkts",
+                "tx": lambda v: f"tx={v}pkts",
+            }
+            parts = [formatters[k](metrics[k]) for k in ["rtt", "jitter", "lost", "rx", "tx"] if k in metrics]
+            log.info("[stats %s] %s", peer_id, "  ".join(parts))
+
 
 async def wait_for_ice(pc: RTCPeerConnection) -> None:
     if pc.iceGatheringState == "complete":
         return
-    fut: asyncio.Future = asyncio.get_event_loop().create_future()
-
-    @pc.on("icegatheringstatechange")
-    def _on_change() -> None:
-        if pc.iceGatheringState == "complete" and not fut.done():
-            fut.set_result(None)
-
-    await fut
+    done = asyncio.Event()
+    pc.on("icegatheringstatechange", lambda *_: done.is_set() or done.set())
+    await done.wait()
 
 
 class Mesh:
-    """
-    Owns one RTCPeerConnection per remote participant. The local mic track
-    is captured once and fanned out to each connection via MediaRelay so
-    every peer gets its own copy of the stream.
-    """
+    """One RTCPeerConnection per remote participant, mic fanned out via MediaRelay."""
 
     def __init__(self, ws, mic_track) -> None:
-        self.ws = ws
-        self.relay = MediaRelay()
+        self.ws        = ws
+        self.relay     = MediaRelay()
         self.mic_track = mic_track
-        self.pcs: dict[str, RTCPeerConnection] = {}
-        self.tasks: set[asyncio.Task] = set()
+        self.pcs:  dict[str, RTCPeerConnection] = {}
+        self.tasks: set[asyncio.Task]           = set()
+
+    def _spawn(self, coro) -> None:
+        t = asyncio.ensure_future(coro)
+        self.tasks.add(t)
+        t.add_done_callback(self.tasks.discard)
 
     def _new_pc(self, peer_id: str) -> RTCPeerConnection:
-        pc = RTCPeerConnection(configuration=STUN_CONFIG)
+        pc = RTCPeerConnection(configuration=STUN)
         pc.addTrack(self.relay.subscribe(self.mic_track))
 
         @pc.on("track")
         def on_track(track) -> None:
             if track.kind == "audio":
-                t = asyncio.ensure_future(play_remote_track(track))
-                self.tasks.add(t)
-                t.add_done_callback(self.tasks.discard)
+                self._spawn(play_remote_track(track))
 
         @pc.on("connectionstatechange")
         async def on_state() -> None:
-            log.info("peer %s: connection state -> %s", peer_id, pc.connectionState)
+            log.info("peer %s → %s", peer_id, pc.connectionState)
+            if pc.connectionState == "connected":
+                self._spawn(log_stats(pc, peer_id))
 
         self.pcs[peer_id] = pc
         return pc
 
+    async def _send(self, **msg) -> None:
+        await self.ws.send(json.dumps(msg))
+
     async def connect_to(self, peer_id: str) -> None:
-        """We are joining and peer_id is already in the room: send an offer."""
         pc = self._new_pc(peer_id)
         offer = await pc.createOffer()
         await pc.setLocalDescription(offer)
         await wait_for_ice(pc)
-        await self.ws.send(json.dumps({"type": "offer", "to": peer_id, "sdp": pc.localDescription.sdp}))
-        log.info("Sent offer to peer %s", peer_id)
+        await self._send(type="offer", to=peer_id, sdp=pc.localDescription.sdp)
 
     async def handle_offer(self, peer_id: str, sdp: str) -> None:
-        """peer_id is joining and sent us an offer: answer it."""
         pc = self._new_pc(peer_id)
         await pc.setRemoteDescription(RTCSessionDescription(sdp, "offer"))
         answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
         await wait_for_ice(pc)
-        await self.ws.send(json.dumps({"type": "answer", "to": peer_id, "sdp": pc.localDescription.sdp}))
-        log.info("Answered offer from peer %s", peer_id)
+        await self._send(type="answer", to=peer_id, sdp=pc.localDescription.sdp)
 
     async def handle_answer(self, peer_id: str, sdp: str) -> None:
-        pc = self.pcs.get(peer_id)
-        if pc is not None:
+        if pc := self.pcs.get(peer_id):
             await pc.setRemoteDescription(RTCSessionDescription(sdp, "answer"))
-            log.info("Connected to peer %s", peer_id)
 
     async def remove_peer(self, peer_id: str) -> None:
-        pc = self.pcs.pop(peer_id, None)
-        if pc is not None:
+        if pc := self.pcs.pop(peer_id, None):
             await pc.close()
-            log.info("Closed connection to peer %s (left)", peer_id)
+            log.info("peer %s left", peer_id)
 
     async def close(self) -> None:
         for t in self.tasks:
@@ -228,55 +249,40 @@ class Mesh:
 
 async def run(server_url: str, mic_device: str | None, mic_format: str | None) -> None:
     player, mic_track = open_microphone(mic_device, mic_format)
-
     async with websockets.connect(server_url, max_size=None) as ws:
         mesh = Mesh(ws, mic_track)
         try:
             async for raw in ws:
                 msg = json.loads(raw)
-                mtype = msg["type"]
-
-                if mtype == "welcome":
-                    my_id = msg["id"]
-                    log.info("Connected as peer %s", my_id)
-                    for peer_id in msg["peers"]:
-                        await mesh.connect_to(peer_id)
-
-                elif mtype == "peer-joined":
-                    log.info("Peer %s joined — waiting for their offer", msg["id"])
-
-                elif mtype == "peer-left":
-                    await mesh.remove_peer(msg["id"])
-
-                elif mtype == "offer":
-                    await mesh.handle_offer(msg["from"], msg["sdp"])
-
-                elif mtype == "answer":
-                    await mesh.handle_answer(msg["from"], msg["sdp"])
-
+                match msg["type"]:
+                    case "welcome":
+                        log.info("Joined as peer %s  (%d others present)", msg["id"], len(msg["peers"]))
+                        for pid in msg["peers"]:
+                            await mesh.connect_to(pid)
+                    case "peer-joined":
+                        log.info("Peer %s joined", msg["id"])
+                    case "peer-left":
+                        await mesh.remove_peer(msg["id"])
+                    case "offer":
+                        await mesh.handle_offer(msg["from"], msg["sdp"])
+                    case "answer":
+                        await mesh.handle_answer(msg["from"], msg["sdp"])
         except (asyncio.CancelledError, KeyboardInterrupt):
             pass
         finally:
             await mesh.close()
-            player.audio.stop() if hasattr(player.audio, "stop") else None
             log.info("Disconnected.")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Entry point
-# ─────────────────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Multi-peer WebRTC voice chat client")
-    ap.add_argument("--server", default="ws://localhost:8765", help="Signalling server URL")
-    ap.add_argument("--mic-device", default=None, help="Override microphone device string")
-    ap.add_argument("--mic-format", default=None, help="Override ffmpeg input format (avfoundation/pulse/alsa/dshow)")
+    ap = argparse.ArgumentParser(description="Multi-peer WebRTC voice chat")
+    ap.add_argument("--server",     default="ws://localhost:8765")
+    ap.add_argument("--mic-device", default=None)
+    ap.add_argument("--mic-format", default=None)
     args = ap.parse_args()
-
     try:
         asyncio.run(run(args.server, args.mic_device, args.mic_format))
     except KeyboardInterrupt:
         pass
-    except Exception as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(1)
+    except Exception as e:
+        sys.exit(f"Error: {e}")

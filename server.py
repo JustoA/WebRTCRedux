@@ -2,31 +2,30 @@
 """
 server.py - WebSocket signalling relay for a full-mesh voice chat.
 
-This server does NOT run any WebRTC PeerConnections itself — it only
-assigns each connecting client an id and relays JSON signalling messages
-between specific clients (by id). All audio flows directly peer-to-peer.
+All audio flows directly peer-to-peer.
 
-Protocol (JSON over WebSocket)
-───────────────────────────────
-  Server → Client   {"type": "welcome", "id": "<my_id>", "peers": ["<id>", ...]}
+Protocol:
+  Server -> Client   {"type": "welcome", "id": "<my_id>", "peers": ["<id>", ...]}
                        Sent once on connect. `peers` lists everyone already
-                       in the room — the new client is responsible for
+                       in the room - the new client is responsible for
                        initiating a connection to each of them.
 
-  Server → Client   {"type": "peer-joined", "id": "<id>"}
+  Server -> Client   {"type": "peer-joined", "id": "<id>"}
                        Sent to existing clients when someone new connects.
-                       No action needed — the new peer initiates.
+                       No action needed - the new peer initiates.
 
-  Server → Client   {"type": "peer-left", "id": "<id>"}
+  Server -> Client   {"type": "peer-left", "id": "<id>"}
                        Sent when a client disconnects, so others can close
                        their PeerConnection to it.
 
-  Client → Server   {"type": "offer"|"answer", "to": "<id>", "sdp": "..."}
+  Client -> Server   {"type": "offer"|"answer", "to": "<id>", "sdp": "..."}
                        Server adds "from": "<sender_id>" and forwards
                        verbatim to the target client.
 
-Run:
+Requirements:
     pip install websockets
+
+Usage:    
     python server.py [--host 0.0.0.0] [--port 8765]
 """
 from __future__ import annotations
@@ -54,7 +53,7 @@ async def handler(ws: websockets.WebSocketServerProtocol) -> None:
     # Tell the newcomer who's already here.
     await ws.send(json.dumps({"type": "welcome", "id": my_id, "peers": [p for p in clients if p != my_id]}))
 
-    # Tell everyone else about the newcomer (informational only — the
+    # Tell everyone else about the newcomer (informational only; the
     # newcomer is the one who initiates the connection).
     await broadcast({"type": "peer-joined", "id": my_id}, exclude=my_id)
 
