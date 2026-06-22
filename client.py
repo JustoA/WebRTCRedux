@@ -83,29 +83,30 @@ async def play_remote_track(track) -> None:
     def callback(outdata: np.ndarray, frames: int, _t, _s) -> None:
         nonlocal leftover
         
-        pos = 0
-        # Use leftover data first
-        if len(leftover) > 0:
-            take = min(len(leftover), frames)
-            outdata[:take, 0] = leftover[:take]
-            leftover = leftover[take:]
-            pos = take
+        write_pos = 0
         
-        # Fill remaining from buffer
-        while pos < frames and buf:
+        # Fill from leftover data first
+        if leftover.size:
+            samples_to_write = min(len(leftover), frames)
+            outdata[:samples_to_write, 0] = leftover[:samples_to_write]
+            leftover = leftover[samples_to_write:]
+            write_pos = samples_to_write
+        
+        # Fill remaining space from buffer
+        while write_pos < frames and buf:
             chunk = buf.popleft()
-            take = min(len(chunk), frames - pos)
-            outdata[pos:pos + take, 0] = chunk[:take]
-            pos += take
+            samples_to_write = min(len(chunk), frames - write_pos)
+            outdata[write_pos:write_pos + samples_to_write, 0] = chunk[:samples_to_write]
+            write_pos += samples_to_write
             
-            # Save remainder for next callback
-            if take < len(chunk):
-                leftover = chunk[take:]
+            # Save excess data for next callback
+            if samples_to_write < len(chunk):
+                leftover = chunk[samples_to_write:]
                 return
         
-        # Pad with silence if buffer exhausted
-        if pos < frames:
-            outdata[pos:, 0] = 0
+        # Pad remaining space with silence
+        if write_pos < frames:
+            outdata[write_pos:, 0] = 0
 
     def push(frame) -> None:
         for rf in resampler.resample(frame) or []:
@@ -137,46 +138,53 @@ async def log_stats(pc: RTCPeerConnection, peer_id: str, interval: float = 5.0) 
 
         metrics = {}
         
-        for s in stats.values():
-            s_type = getattr(s, "type", "")
+        for stat in stats.values():
+            stat_type = getattr(stat, "type", "")
+            is_audio = getattr(stat, "kind", "") == "audio"
             
-            # Extract audio inbound stats
-            if s_type == "inbound-rtp" and getattr(s, "kind", "") == "audio":
-                if (j := getattr(s, "jitter", None)) is not None:
-                    metrics["jitter"] = j / RATE * 1000  # ticks -> ms
-                if (lost := getattr(s, "packetsLost", None)) is not None:
-                    metrics["lost"] = lost
-                if (rx := getattr(s, "packetsReceived", None)) is not None:
-                    metrics["rx"] = rx
+            # Collect incoming audio metrics
+            if stat_type == "inbound-rtp" and is_audio:
+                if (jitter := getattr(stat, "jitter", None)) is not None:
+                    metrics["jitter"] = jitter / RATE * 1000  # convert ticks to ms
+                if (packets_lost := getattr(stat, "packetsLost", None)) is not None:
+                    metrics["lost"] = packets_lost
+                if (packets_rx := getattr(stat, "packetsReceived", None)) is not None:
+                    metrics["rx"] = packets_rx
             
-            # Extract audio outbound stats
-            elif s_type == "outbound-rtp" and getattr(s, "kind", "") == "audio":
-                if (tx := getattr(s, "packetsSent", None)) is not None:
-                    metrics["tx"] = tx
+            # Collect outgoing audio metrics
+            elif stat_type == "outbound-rtp" and is_audio:
+                if (packets_tx := getattr(stat, "packetsSent", None)) is not None:
+                    metrics["tx"] = packets_tx
             
-            # Extract connection quality stats
-            elif s_type == "candidate-pair" and getattr(s, "nominated", False):
-                if (r := getattr(s, "currentRoundTripTime", None)) is not None:
-                    metrics["rtt"] = r * 1000  # s -> ms
+            # Collect connection quality metrics
+            elif stat_type == "candidate-pair" and getattr(stat, "nominated", False):
+                if (rtt := getattr(stat, "currentRoundTripTime", None)) is not None:
+                    metrics["rtt"] = rtt * 1000  # convert seconds to ms
 
         # Format and log stats
         if metrics:
-            formatters = {
+            format_metric = {
                 "rtt": lambda v: f"RTT={v:.1f}ms",
                 "jitter": lambda v: f"jitter={v:.1f}ms",
                 "lost": lambda v: f"lost={v}",
                 "rx": lambda v: f"rx={v}pkts",
                 "tx": lambda v: f"tx={v}pkts",
             }
-            parts = [formatters[k](metrics[k]) for k in ["rtt", "jitter", "lost", "rx", "tx"] if k in metrics]
-            log.info("[stats %s] %s", peer_id, "  ".join(parts))
+            ordered_keys = ["rtt", "jitter", "lost", "rx", "tx"]
+            formatted_stats = [format_metric[k](metrics[k]) for k in ordered_keys if k in metrics]
+            log.info("[stats %s] %s", peer_id, "  ".join(formatted_stats))
 
 
 async def wait_for_ice(pc: RTCPeerConnection) -> None:
     if pc.iceGatheringState == "complete":
         return
     done = asyncio.Event()
-    pc.on("icegatheringstatechange", lambda *_: done.is_set() or done.set())
+    
+    def on_gathering_complete(*_) -> None:
+        if not done.is_set():
+            done.set()
+    
+    pc.on("icegatheringstatechange", on_gathering_complete)
     await done.wait()
 
 
@@ -200,12 +208,12 @@ class Mesh:
         pc.addTrack(self.relay.subscribe(self.mic_track))
 
         @pc.on("track")
-        def on_track(track) -> None:
+        def on_remote_track(track) -> None:
             if track.kind == "audio":
                 self._spawn(play_remote_track(track))
 
         @pc.on("connectionstatechange")
-        async def on_state() -> None:
+        def on_connection_change() -> None:
             log.info("peer %s → %s", peer_id, pc.connectionState)
             if pc.connectionState == "connected":
                 self._spawn(log_stats(pc, peer_id))
