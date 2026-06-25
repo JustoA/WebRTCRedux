@@ -4,7 +4,7 @@ Statistics collection and logging for WebRTC peer connections.
 import asyncio
 import logging
 
-from aiortc import RTCPeerConnection
+from aiortc import RTCPeerConnection, RTCStatsReport
 
 from config import RATE
 
@@ -25,17 +25,18 @@ async def log_stats(pc: RTCPeerConnection, peer_id: str, interval: float = 5.0) 
     while True:
         await asyncio.sleep(interval)
         try:
-            stats = await pc.getStats()
+            stats: RTCStatsReport = await pc.getStats()
         except Exception:
             return
 
         metrics = {}
 
         for stat in stats.values():
-            stat_type = getattr(stat, "type", "")
-            is_audio = getattr(stat, "kind", "") == "audio"
+            stat_type = getattr(stat, "type", None)
+            is_audio = getattr(stat, "kind", None) == "audio"
 
             # Collect incoming audio metrics
+            # 
             if stat_type == "inbound-rtp" and is_audio:
                 if (jitter := getattr(stat, "jitter", None)) is not None:
                     metrics["jitter"] = jitter / RATE * 1000  # convert ticks to ms
