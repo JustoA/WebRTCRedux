@@ -1,0 +1,58 @@
+# Run the signalling server:
+#   podman compose up server
+#
+# Run a client (repeat on each machine that wants to join):
+#   SERVER=ws://<host>:8765 podman compose up client
+#
+# The SERVER env var defaults to ws://localhost:8765 for local testing.
+
+services:
+
+  server:
+    build:
+      context: .
+      target: server
+    ports:
+      - "8765:8765"
+    restart: unless-stopped
+
+  client:
+    build:
+      context: .
+      target: client
+
+    # Must be host so WebRTC ICE candidates advertise the real machine IP.
+    # Bridge-mode containers would advertise 172.x which remote peers can't reach.
+    network_mode: host
+
+    environment:
+      # Pass the signalling server address in (defaults to localhost for local testing).
+      SERVER: ${SERVER:-ws://localhost:8765}
+      # Point libpulse at the host PulseAudio socket.
+      PULSE_SERVER: unix:/run/pulse/native
+
+    volumes:
+      # Mount the host PulseAudio socket so the container can capture the
+      # mic and play to the speaker.  XDG_RUNTIME_DIR is /run/user/<uid>
+      # (usually /run/user/1000).  Set it in your shell if it differs:
+      #   export XDG_RUNTIME_DIR=/run/user/$(id -u)
+      - ${XDG_RUNTIME_DIR:-/run/user/1000}/pulse/native:/run/pulse/native:ro
+
+    devices:
+      # Give PortAudio access to ALSA as a fallback if PulseAudio isn't running.
+      - /dev/snd:/dev/snd
+
+    ulimits:
+      # Allow PortAudio to use real-time thread priorities.
+      rtprio: 95
+      memlock: -1
+
+    command:
+      - python
+      - client.py
+      - --server
+      - ${SERVER:-ws://localhost:8765}
+      - --mic-format
+      - pulse
+      - --mic-device
+      - default
