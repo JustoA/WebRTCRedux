@@ -4,6 +4,7 @@
 
 import asyncio
 import json
+import websockets
 from websockets.asyncio.server import serve
 from itertools import count
 
@@ -35,8 +36,8 @@ connected_clients: dict[str, int] = {}
 connected_clients_websockets = {}
 id_gen = count(start=1)
 
-async def send_welcome_message(websocket):
-    msg = {"type":"WELCOME", "port":PORTS_START_AT, "clients":connected_clients}
+async def send_welcome_message(websocket, new_client_id):
+    msg = {"type":"WELCOME", "port":PORTS_START_AT, "clients":connected_clients, "your_id":new_client_id}
     await websocket.send(json.dumps(msg))
 
 async def send_client_left_message():
@@ -53,15 +54,17 @@ async def send_new_friend_message(client_ip_addr: str, new_client_id: int):
 
 async def on_message(websocket):
     print("connected clients:", connected_clients)
+    client_ip = websocket.remote_address[0]
     async for message in websocket:
         try:
+            print(message)
             msg_json = json.loads(message)
             msg_type = msg_json["type"]
             if msg_type == 'HELLO':
                 print("Got hello!")
-                client_ip_addr = msg_json["ip"] 
+                client_ip_addr = client_ip
                 new_client_id = next(id_gen)
-                await send_welcome_message(websocket)
+                await send_welcome_message(websocket, new_client_id)
 
                 connected_clients[client_ip_addr] = new_client_id
 
@@ -71,8 +74,8 @@ async def on_message(websocket):
 
 
             if msg_type == 'BYE':
-                left_client_ip = msg_json["ip_address"]
-                client_that_left = connected_clients.pop(left_client_ip)
+                client_that_left = connected_clients.pop(client_ip)
+                await send_client_left_message()
                 pass # todo
 
         except Exception as e:
