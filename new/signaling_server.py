@@ -79,7 +79,7 @@ async def on_message(websocket):
                 pass # todo
 
         except Exception as e:
-            print("ERROR: ", str(e))
+            print(e)
         await websocket.send(message)
 
 
