@@ -18,7 +18,7 @@ def connect_to_client_with_gstreamer(ip_addr: str, my_id : int,  other_id: int):
     port_to_listen_on = str(PORTS_START_AT + other_id)
 
     ACTIVE_OUTGOING_CONNECTIONS[other_id] = subprocess.Popen(["gst-launch-1.0", "-v", "pulsesrc", "!",   "audioconvert", "!",   "audioresample", "!",   "opusenc", "audio-type=restricted-lowdelay", "frame-size=5", "complexity=0", "bandwidth=1102", "bitrate=64000", "!",   "rtpopuspay", "!",  "udpsink", f"host={ip_addr}", f"port={port_to_connect_to}", "sync=false", "async=false"])
-    ACTIVE_INCOMING_CONNECTIONS[other_id] = subprocess.Popen(["gst-launch-1.0", "-v",  "udpsrc", f"port={port_to_listen_on}", "buffer-size=524288", "caps=\"application/x-rtp, media=audio, clock-rate=48000, encoding-name=OPUS, payload=96\"", "!",   "rtpjitterbuffer", "!", "rtpopusdepay", "!",   "opusdec", "!",   "audioconvert", "!",   "audioresample", "!",  "pulsesink", "buffer-time=5000", "latency-time=1000", "sync=false"])
+    ACTIVE_INCOMING_CONNECTIONS[other_id] = subprocess.Popen(["gst-launch-1.0", "-v",  "udpsrc", f"port={port_to_listen_on}", "buffer-size=524288", "caps=\"application/x-rtp, media=audio, clock-rate=48000, encoding-name=OPUS, payload=96\"", "!",   "rtpjitterbuffer", "latency=20", "!", "rtpopusdepay", "!",   "opusdec", "!",   "audioconvert", "!",   "audioresample", "!",  "pulsesink", "buffer-time=5000", "latency-time=1000", "sync=false"])
 
 async def run(server_url: str) -> None:
     my_id = 0
