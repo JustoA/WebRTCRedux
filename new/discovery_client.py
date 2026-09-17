@@ -1,92 +1,62 @@
-#!/usr/bin/env python
-
-"""Echo server using the asyncio API."""
-
+import argparse
 import asyncio
-import json
 import websockets
-from websockets.asyncio.server import serve
-from itertools import count
+import json
+import sys
+import subprocess
 
-# store connected clients as a dictionary where key = client ip, and values = tuple of (ip address, ports in use)
 
 # Change this to whatever port range you want.
 PORTS_START_AT = 40000
 
-# Server prescribes what port to listen on
-
-"""
-You get the port number to listen on like so:
-PORTS_START_AT + other_client_id
-So clients 1 and 2 will listen on 40002 and 40001 respectively
-By virtue of UDP, we dont really have to worry too much about connections starting at different times
+ACTIVE_OUTGOING_CONNECTIONS: dict[int,subprocess.Popen] = {}
+ACTIVE_INCOMING_CONNECTIONS: dict[int,subprocess.Popen] = {}
 
 
-Possible WS messages:
-Name - Direction - Purpose - JSON
-Hello - Client -> Server - Client announcing that it has joined - {type:'HELLO', ip: ip_address}
-Welcome - Server -> Client - Server informs of clients and ports - {type: 'WELCOME', port: starting_port, clients: [(client,id)...]}
-New Friend - Server -> Client - Server informs existing clients that a new member has joined - {type: 'NEWFRIEND', ip: ip_address, id:  id}
-Bye - Client -> Server - Client leaves - {type: 'BYE', ip_address}
-Client Left - Server -> Client - Server letting clients know someone disconnected - {'CLIENTLEFT', id}
+def connect_to_client_with_gstreamer(ip_addr: str, my_id : int,  other_id: int):
+    port_to_connect_to = PORTS_START_AT + my_id
+    port_to_listen_on = str(PORTS_START_AT + other_id)
 
-"""
-#                     ip_addr, id
-connected_clients: dict[str, int] = {}
-connected_clients_websockets = {}
-id_gen = count(start=1)
+    ACTIVE_OUTGOING_CONNECTIONS[other_id] = subprocess.Popen(["gst-launch-1.0", "-v", "pulsesrc", "!",   "audioconvert", "!",   "audioresample", "!",   "opusenc", "audio-type=restricted-lowdelay", "frame-size=5", "complexity=0", "bandwidth=1102", "bitrate=64000", "!",   "rtpopuspay", "!",  "udpsink", f"host={ip_addr}", f"port={port_to_connect_to}", "sync=false", "async=false"])
+    ACTIVE_INCOMING_CONNECTIONS[other_id] = subprocess.Popen(["gst-launch-1.0", "-v",  "udpsrc", f"port={port_to_listen_on}", "buffer-size=524288", "caps=\"application/x-rtp, media=audio, clock-rate=48000, encoding-name=OPUS, payload=96\"", "!",   "rtpjitterbuffer", "!", "rtpopusdepay", "!",   "opusdec", "!",   "audioconvert", "!",   "audioresample", "!",  "pulsesink", "buffer-time=5000", "latency-time=1000", "sync=false"])
 
-async def send_welcome_message(websocket, new_client_id):
-    msg = {"type":"WELCOME", "port":PORTS_START_AT, "clients":connected_clients, "your_id":new_client_id}
-    await websocket.send(json.dumps(msg))
-
-async def send_client_left_message():
-    pass
-
-async def send_new_friend_message(client_ip_addr: str, new_client_id: int):
-    msg = {"type":"NEWFRIEND","ip":client_ip_addr,"id":new_client_id}
-    for client, ws in connected_clients_websockets.items():
-        if client == client_ip_addr:
-            continue # dont connect to yourself
-        else:
-            await ws.send(json.dumps(msg))
-
-
-async def on_message(websocket):
-    print("connected clients:", connected_clients)
-    client_ip = websocket.remote_address[0]
-    async for message in websocket:
+async def run(server_url: str) -> None:
+    my_id = 0
+    async with websockets.connect(server_url, max_size=None) as ws:
         try:
-            print(message)
-            msg_json = json.loads(message)
-            msg_type = msg_json["type"]
-            if msg_type == 'HELLO':
-                print("Got hello!")
-                client_ip_addr = client_ip
-                new_client_id = next(id_gen)
-                await send_welcome_message(websocket, new_client_id)
+            await ws.send('{"type":"HELLO"}')
+            async for raw in ws:
+                msg = json.loads(raw)
+                match msg["type"]:
+                    case "WELCOME":
+                        my_id = int(msg["your_id"])
+                        print(f"Joined as peer {my_id}  ({len(msg["clients"])} others present)")   
+                        client_dict = dict(msg["clients"])
+                        for client_ip, client_id in client_dict.items():
+                            connect_to_client_with_gstreamer(client_ip, my_id, client_id)
+                    case "NEWFRIEND":
+                        print(f"Peer {msg["client_id"]} joined")
+                        connect_to_client_with_gstreamer(msg["ip"], my_id, msg("id"))
+                    case "CLIENTLEFT":
+                        print(f"Terminating connections with client id {msg['id']}")
+                        ACTIVE_OUTGOING_CONNECTIONS[msg["id"]].kill()
+                        ACTIVE_INCOMING_CONNECTIONS[msg["id"]].kill()
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            pass
+        finally:
+            await ws.send('{"type":"BYE"}')
 
-                connected_clients[client_ip_addr] = new_client_id
-
-                connected_clients_websockets[client_ip_addr] = websocket
-
-                await send_new_friend_message(client_ip_addr, new_client_id)
-
-
-            if msg_type == 'BYE':
-                client_that_left = connected_clients.pop(client_ip)
-                await send_client_left_message()
-                pass # todo
-
-        except Exception as e:
-            print("ERROR: ", str(e))
-        await websocket.send(message)
-
-
-async def main():
-    server = await serve(on_message, "localhost", 8765)
-    await server.serve_forever()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    ap = argparse.ArgumentParser(description="Multi-peer WebRTC voice chat")
+    ap.add_argument("--server",     default="ws://localhost:8765")
+    ap.add_argument("--mic-device", default=0,
+                    help="sounddevice device index or name (default: system default)")
+    args = ap.parse_args()
+    try:
+        asyncio.run(run(args.server))
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        sys.exit(f"Error: {e}")
